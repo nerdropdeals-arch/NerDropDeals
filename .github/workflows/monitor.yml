@@ -1,0 +1,40 @@
+name: Monitor offerte NerDrop
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # ogni 5 minuti
+  workflow_dispatch: {}      # permette di lanciarlo anche a mano da GitHub
+
+permissions:
+  contents: write            # serve per poter ricommittare data/notified.json
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Esegui script di monitoraggio
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          AMAZON_AFFILIATE_TAG: ${{ secrets.AMAZON_AFFILIATE_TAG }}
+        run: python script/main.py
+
+      - name: Salva lo stato aggiornato nel repo
+        run: |
+          git config user.name "nerdrop-bot"
+          git config user.email "actions@github.com"
+          git add data/notified.json
+          git diff --quiet --cached || git commit -m "Aggiorna stato offerte notificate"
+          git push
