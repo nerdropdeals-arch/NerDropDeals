@@ -60,7 +60,9 @@ def save_state(state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def estrai_asin(url: str) -> str | None:
-    match = re.search(r"/dp/([A-Z0-9]{10})", url)
+    # Copre sia il formato classico /dp/ASIN sia varianti come
+    # /gp/aw/d/ASIN o /gp/product/ASIN (link "widget"/condivisi da ricerca).
+    match = re.search(r"/(?:dp|gp/aw/d|gp/product)/([A-Z0-9]{10})", url)
     return match.group(1) if match else None
 
 
