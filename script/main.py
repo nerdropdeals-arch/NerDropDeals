@@ -1,13 +1,15 @@
 """
-NerDrop - Monitor offerte Amazon (Informatica/Elettronica)
-Scarica le pagine offerte Amazon, confronta con lo storico locale,
-e pubblica su Telegram le offerte che superano una soglia di sconto.
+NerDrop - Bot semi-automatico
+L'utente manda al bot (in chat privata) il link di un prodotto Amazon che ha
+trovato lui stesso. Lo script legge i messaggi nuovi, scarica QUELLA SINGOLA
+pagina prodotto (consentito da robots.txt, a differenza delle pagine di
+ricerca/offerte), estrae titolo/prezzo/immagine, aggiunge il link affiliato
+e pubblica sul canale Telegram.
 """
 
 import json
 import os
 import re
-import time
 from pathlib import Path
 
 import requests
@@ -17,20 +19,15 @@ from bs4 import BeautifulSoup
 # Configurazione
 # ---------------------------------------------------------------------------
 
-# Categorie da monitorare: nome interno -> URL pagina offerte Amazon.it
-CATEGORIE = {
-    "informatica": "https://www.amazon.it/deals?bubble-id=deals-collection-computers",
-    "elettronica": "https://www.amazon.it/deals?bubble-id=deals-collection-electronics",
-}
-
-SOGLIA_SCONTO_PERCENTUALE = 30  # notifica solo sconti sopra questa soglia
-PREZZO_MINIMO = 20.0            # ignora prodotti troppo economici (rumore)
-
-STATE_FILE = Path(__file__).parent.parent / "data" / "notified.json"
+STATE_FILE = Path(__file__).parent.parent / "data" / "telegram_offset.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@nerdropdeals")
 AFFILIATE_TAG = os.environ.get("AMAZON_AFFILIATE_TAG", "")  # es. nerdrop-21
+
+# Solo i messaggi che arrivano da questo ID Telegram vengono processati.
+# Protegge il bot da chiunque altro scopra lo username e provi a scrivergli.
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 
 HEADERS = {
     "User-Agent": (
@@ -40,7 +37,7 @@ HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9",
 }
 
-REQUEST_DELAY_SECONDS = 3  # pausa tra una richiesta e l'altra, per essere "gentili"
+AMAZON_URL_PATTERN = re.compile(r"https?://(?:www\.)?amazon\.[a-z.]+/[^\s]*")
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +56,7 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scraping
+# Lettura pagina prodotto (singola, quella che l'utente ha mandato)
 # ---------------------------------------------------------------------------
 
 def estrai_asin(url: str) -> str | None:
@@ -76,59 +73,49 @@ def parse_prezzo(testo: str) -> float | None:
     return float(match.group()) if match else None
 
 
-def scrape_categoria(nome: str, url: str) -> list[dict]:
+def leggi_prodotto(url: str) -> dict | None:
     """
-    Ritorna una lista di offerte trovate nella pagina.
-    NOTA: i selettori CSS di Amazon cambiano spesso — questa è una base
-    di partenza da verificare/aggiustare guardando l'HTML reale.
+    Scarica la singola pagina prodotto (consentito da robots.txt) ed estrae
+    titolo, prezzo e immagine. I selettori sono quelli standard delle pagine
+    prodotto Amazon, ma vanno verificati/aggiustati se Amazon cambia layout.
     """
-    offerte = []
+    asin = estrai_asin(url)
+    if not asin:
+        print(f"Link non riconosciuto come pagina prodotto Amazon: {url}")
+        return None
+
+    url_pulito = f"https://www.amazon.it/dp/{asin}"
+
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url_pulito, headers=HEADERS, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        print(f"[{nome}] Errore nel download della pagina: {exc}")
-        return offerte
+        print(f"Errore nel download della pagina prodotto: {exc}")
+        return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Selettore indicativo: le card offerta Amazon usano vari data-testid
-    # a seconda del layout. Da verificare/adattare ispezionando la pagina.
-    cards = soup.select("[data-testid='deal-card']") or soup.select("div.DealCard")
+    titolo_el = soup.select_one("#productTitle")
+    titolo = titolo_el.get_text(strip=True) if titolo_el else "Prodotto Amazon"
 
-    for card in cards:
-        link_el = card.select_one("a[href*='/dp/']")
-        if not link_el:
-            continue
-        href = link_el.get("href", "")
-        asin = estrai_asin(href)
-        if not asin:
-            continue
+    prezzo_el = (
+        soup.select_one("#corePrice_feature_div .a-price .a-offscreen")
+        or soup.select_one(".priceToPay .a-offscreen")
+        or soup.select_one("#priceblock_ourprice")
+        or soup.select_one(".a-price .a-offscreen")
+    )
+    prezzo = parse_prezzo(prezzo_el.get_text(strip=True)) if prezzo_el else None
 
-        titolo_el = card.select_one("[data-testid='deal-title']") or card.select_one("span.a-truncate-full")
-        titolo = titolo_el.get_text(strip=True) if titolo_el else "Prodotto senza titolo"
+    immagine_el = soup.select_one("#landingImage")
+    immagine_url = immagine_el.get("src") if immagine_el else None
 
-        prezzo_el = card.select_one(".a-price .a-offscreen")
-        prezzo_attuale = parse_prezzo(prezzo_el.get_text(strip=True)) if prezzo_el else None
-
-        sconto_el = card.select_one("[data-testid='deal-badge']")
-        sconto_testo = sconto_el.get_text(strip=True) if sconto_el else ""
-        sconto_match = re.search(r"(\d+)\s*%", sconto_testo)
-        sconto_percentuale = int(sconto_match.group(1)) if sconto_match else None
-
-        if prezzo_attuale is None or sconto_percentuale is None:
-            continue
-
-        offerte.append({
-            "asin": asin,
-            "categoria": nome,
-            "titolo": titolo,
-            "prezzo_attuale": prezzo_attuale,
-            "sconto_percentuale": sconto_percentuale,
-            "url": f"https://www.amazon.it/dp/{asin}",
-        })
-
-    return offerte
+    return {
+        "asin": asin,
+        "titolo": titolo,
+        "prezzo_attuale": prezzo,
+        "immagine_url": immagine_url,
+        "url": url_pulito,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -142,29 +129,43 @@ def costruisci_link_affiliato(url: str) -> str:
     return f"{url}{separatore}tag={AFFILIATE_TAG}"
 
 
-def formatta_messaggio(offerta: dict) -> str:
-    link = costruisci_link_affiliato(offerta["url"])
+def formatta_messaggio(prodotto: dict) -> str:
+    link = costruisci_link_affiliato(prodotto["url"])
+    prezzo_testo = (
+        f"💶 <b>{prodotto['prezzo_attuale']:.2f} €</b>\n\n"
+        if prodotto["prezzo_attuale"] is not None
+        else ""
+    )
     return (
-        f"🔥 <b>-{offerta['sconto_percentuale']}%</b>\n\n"
-        f"{offerta['titolo']}\n\n"
-        f"💶 <b>{offerta['prezzo_attuale']:.2f} €</b>\n\n"
-        f"👉 <a href=\"{link}\">Vai all'offerta</a>\n\n"
-        f"#{offerta['categoria']}"
+        f"🔥 <b>{prodotto['titolo']}</b>\n\n"
+        f"{prezzo_testo}"
+        f"👉 <a href=\"{link}\">Vai all'offerta</a>"
     )
 
 
-def pubblica_su_telegram(testo: str) -> bool:
+def pubblica_su_telegram(prodotto: dict, testo: str) -> bool:
     if not TELEGRAM_BOT_TOKEN:
         print("TELEGRAM_BOT_TOKEN non impostato, salto la pubblicazione.")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHANNEL_ID,
-        "text": testo,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+    # Se abbiamo trovato un'immagine, pubblichiamo foto+didascalia,
+    # altrimenti solo testo.
+    if prodotto.get("immagine_url"):
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "photo": prodotto["immagine_url"],
+            "caption": testo,
+            "parse_mode": "HTML",
+        }
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "text": testo,
+            "parse_mode": "HTML",
+        }
+
     resp = requests.post(url, json=payload, timeout=15)
     if not resp.ok:
         print(f"Errore pubblicazione Telegram: {resp.status_code} {resp.text}")
@@ -172,46 +173,87 @@ def pubblica_su_telegram(testo: str) -> bool:
     return True
 
 
+def rispondi_al_proprietario(testo: str) -> None:
+    """Manda una conferma in chat privata, per sapere che è andato tutto bene."""
+    if not TELEGRAM_BOT_TOKEN or not OWNER_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": OWNER_CHAT_ID, "text": testo, "parse_mode": "HTML"}
+    requests.post(url, json=payload, timeout=15)
+
+
+def leggi_nuovi_messaggi(offset: int) -> tuple[list[dict], int]:
+    """
+    Legge i messaggi nuovi arrivati al bot (getUpdates), a partire dall'ultimo
+    offset salvato. Ritorna (lista messaggi, nuovo offset da salvare).
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return [], offset
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": offset, "timeout": 0}
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    messaggi = []
+    nuovo_offset = offset
+
+    for update in data.get("result", []):
+        nuovo_offset = update["update_id"] + 1
+        msg = update.get("message") or update.get("channel_post")
+        if not msg:
+            continue
+        chat_id = msg.get("chat", {}).get("id")
+        testo = msg.get("text", "")
+        messaggi.append({"chat_id": chat_id, "testo": testo})
+
+    return messaggi, nuovo_offset
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    if not OWNER_CHAT_ID:
+        print("OWNER_CHAT_ID non impostato: nessun messaggio verrà processato.")
+
     state = load_state()
-    nuove_pubblicazioni = 0
+    offset = state.get("offset", 0)
 
-    for nome_categoria, url in CATEGORIE.items():
-        print(f"Controllo categoria: {nome_categoria}")
-        offerte = scrape_categoria(nome_categoria, url)
-        print(f"  -> trovate {len(offerte)} offerte grezze")
+    messaggi, nuovo_offset = leggi_nuovi_messaggi(offset)
+    print(f"Messaggi nuovi trovati: {len(messaggi)}")
 
-        for offerta in offerte:
-            asin = offerta["asin"]
+    pubblicazioni = 0
 
-            if offerta["sconto_percentuale"] < SOGLIA_SCONTO_PERCENTUALE:
-                continue
-            if offerta["prezzo_attuale"] < PREZZO_MINIMO:
-                continue
+    for msg in messaggi:
+        if msg["chat_id"] != OWNER_CHAT_ID:
+            print(f"Messaggio ignorato, chat_id non autorizzato: {msg['chat_id']}")
+            continue
 
-            gia_notificata = state.get(asin)
-            # Rinotifica solo se il prezzo è sceso ulteriormente rispetto all'ultima volta
-            if gia_notificata and offerta["prezzo_attuale"] >= gia_notificata.get("prezzo_attuale", 0):
-                continue
+        match = AMAZON_URL_PATTERN.search(msg["testo"])
+        if not match:
+            continue  # non era un link Amazon, ignoriamo
 
-            messaggio = formatta_messaggio(offerta)
-            if pubblica_su_telegram(messaggio):
-                nuove_pubblicazioni += 1
-                state[asin] = {
-                    "prezzo_attuale": offerta["prezzo_attuale"],
-                    "sconto_percentuale": offerta["sconto_percentuale"],
-                    "titolo": offerta["titolo"],
-                }
-                time.sleep(1)  # piccola pausa tra un post e l'altro
+        link = match.group(0)
+        print(f"Link ricevuto: {link}")
 
-        time.sleep(REQUEST_DELAY_SECONDS)
+        prodotto = leggi_prodotto(link)
+        if prodotto is None:
+            rispondi_al_proprietario("⚠️ Non sono riuscito a leggere quella pagina prodotto.")
+            continue
 
+        testo_post = formatta_messaggio(prodotto)
+        if pubblica_su_telegram(prodotto, testo_post):
+            pubblicazioni += 1
+            rispondi_al_proprietario(f"✅ Pubblicato: {prodotto['titolo'][:60]}")
+        else:
+            rispondi_al_proprietario("⚠️ Errore nella pubblicazione sul canale.")
+
+    state["offset"] = nuovo_offset
     save_state(state)
-    print(f"Fatto. Pubblicazioni nuove in questo run: {nuove_pubblicazioni}")
+    print(f"Fatto. Pubblicazioni in questo run: {pubblicazioni}")
 
 
 if __name__ == "__main__":
