@@ -29,12 +29,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           AMAZON_AFFILIATE_TAG: ${{ secrets.AMAZON_AFFILIATE_TAG }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
         run: python script/main.py
 
       - name: Salva lo stato aggiornato nel repo
         run: |
           git config user.name "nerdrop-bot"
           git config user.email "actions@github.com"
-          git add data/notified.json
-          git diff --quiet --cached || git commit -m "Aggiorna stato offerte notificate"
+          git add data/telegram_offset.json
+          git diff --quiet --cached || git commit -m "Aggiorna offset messaggi Telegram"
           git push
